@@ -8,6 +8,16 @@ const MAX_TEXT_LENGTH = 6000; // ~6000 character limit for summary extraction
 const MAX_REDIRECTS = 3;
 
 /**
+ * Creates an operational user-facing error with status 422 Unprocessable Entity or 400 Bad Request.
+ */
+function createOperationalError(message, status = 422) {
+  const err = new Error(message);
+  err.status = status;
+  err.isSanitized = true;
+  return err;
+}
+
+/**
  * Fetches HTML from target URL with redirect re-validation, timeout, size limits, and Cheerio text extraction.
  * @param {string} targetUrl 
  * @returns {Promise<{ title: string, text: string, url: string }>}
@@ -20,7 +30,7 @@ async function scrapeWebpage(targetUrl) {
     // 1. Validate security of the current URL (SSRF & DNS check)
     const securityCheck = await validateUrlSecurity(currentUrl);
     if (!securityCheck.isValid) {
-      throw new Error(securityCheck.error || 'Security check failed for URL.');
+      throw createOperationalError(securityCheck.error || 'Security check failed for URL.', 400);
     }
 
     try {
@@ -45,12 +55,12 @@ async function scrapeWebpage(targetUrl) {
       if (response.status >= 300 && response.status < 400) {
         const redirectLocation = response.headers['location'];
         if (!redirectLocation) {
-          throw new Error('Target server returned redirect status without Location header.');
+          throw createOperationalError('Target server returned redirect status without Location header.', 422);
         }
 
         redirectCount++;
         if (redirectCount > MAX_REDIRECTS) {
-          throw new Error(`Exceeded maximum allowed redirects (${MAX_REDIRECTS}).`);
+          throw createOperationalError(`Exceeded maximum allowed redirects (${MAX_REDIRECTS}).`, 422);
         }
 
         // Resolve relative redirect paths
@@ -61,12 +71,12 @@ async function scrapeWebpage(targetUrl) {
       // Check Content-Type header to ensure response is HTML
       const contentType = response.headers['content-type'] || '';
       if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
-        throw new Error('Target page is not an HTML webpage (received content-type: ' + (contentType.split(';')[0] || 'unknown') + ').');
+        throw createOperationalError('Target page is not an HTML webpage (received content-type: ' + (contentType.split(';')[0] || 'unknown') + ').', 422);
       }
 
       const htmlContent = response.data;
       if (!htmlContent || typeof htmlContent !== 'string' || htmlContent.trim().length === 0) {
-        throw new Error('Target webpage returned empty response.');
+        throw createOperationalError('Target webpage returned empty response.', 422);
       }
 
       // 3. Parse with Cheerio
@@ -88,7 +98,7 @@ async function scrapeWebpage(targetUrl) {
         .trim();
 
       if (mainText.length < 50) {
-        throw new Error('Webpage contains insufficient readable text content to generate a summary.');
+        throw createOperationalError('Webpage contains insufficient readable text content to generate a summary.', 422);
       }
 
       // Truncate text to limit token usage and latency
@@ -103,39 +113,39 @@ async function scrapeWebpage(targetUrl) {
       };
 
     } catch (err) {
-      if (err.message && err.message.startsWith('Security check failed')) {
+      if (err.isSanitized) {
         throw err;
       }
 
       if (err.code === 'ECONNABORTED' || err.message.includes('timeout')) {
-        throw new Error('Request timed out while trying to fetch the webpage (limit: 10 seconds).');
+        throw createOperationalError('Request timed out while trying to fetch the webpage (limit: 10 seconds).', 408);
       }
 
       if (err.response) {
         const status = err.response.status;
         if (status === 401 || status === 403) {
-          throw new Error('Access denied by target website (HTTP ' + status + '). Automated request blocked.');
+          throw createOperationalError('Access denied by target website (HTTP ' + status + '). Automated request blocked.', 422);
         }
         if (status === 404) {
-          throw new Error('Webpage not found (HTTP 404). Please check the URL.');
+          throw createOperationalError('Webpage not found (HTTP 404). Please check the URL.', 404);
         }
         if (status === 429) {
-          throw new Error('Target website rate-limited automated requests (HTTP 429).');
+          throw createOperationalError('Target website rate-limited automated requests (HTTP 429).', 429);
         }
         if (status >= 500) {
-          throw new Error(`Target website server error (HTTP ${status}).`);
+          throw createOperationalError(`Target website server error (HTTP ${status}).`, 502);
         }
       }
 
       if (err.message && (err.message.includes('maxContentLength') || err.message.includes('maxBodyLength'))) {
-        throw new Error('Webpage content exceeds maximum allowed size limit of 2MB.');
+        throw createOperationalError('Webpage content exceeds maximum allowed size limit of 2MB.', 413);
       }
 
-      throw new Error(err.message || 'Failed to fetch webpage content.');
+      throw createOperationalError(err.message || 'Failed to fetch webpage content.', 422);
     }
   }
 
-  throw new Error('Failed to resolve URL after maximum redirects.');
+  throw createOperationalError('Failed to resolve URL after maximum redirects.', 422);
 }
 
 module.exports = {

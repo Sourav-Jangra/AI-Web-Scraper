@@ -10,17 +10,8 @@ function errorHandler(err, req, res, next) {
 
   let clientMessage = 'An unexpected error occurred while processing your request.';
 
-  // If error has been explicitly marked sanitized or comes from operational error
-  if (err.isSanitized || statusCode < 500) {
-    clientMessage = err.message;
-  } else if (err.message && (
-    err.message.includes('URL') ||
-    err.message.includes('webpage') ||
-    err.message.includes('timeout') ||
-    err.message.includes('security') ||
-    err.message.includes('Access denied') ||
-    err.message.includes('redirect')
-  )) {
+  // If error is marked sanitized or is a client/operational error (4xx)
+  if (err.isSanitized || (statusCode >= 400 && statusCode < 500)) {
     clientMessage = err.message;
   }
 

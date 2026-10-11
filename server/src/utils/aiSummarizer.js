@@ -2,37 +2,83 @@ const { GoogleGenAI } = require('@google/genai');
 const OpenAI = require('openai');
 
 /**
+ * Helper to extract status code and message from various Google GenAI SDK & API error structures:
+ */
+function extractErrorInfo(err) {
+  if (!err) return { status: 500, message: '', rawText: '' };
+
+  let status = err.status || err.statusCode || err.code || (err.response && (err.response.status || err.response.statusCode));
+  let message = err.message || '';
+  let rawText = (message + ' ' + (err.errorDetails || '')).toLowerCase();
+
+  // Try parsing JSON embedded in err.message
+  if (message && typeof message === 'string' && message.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed && parsed.error) {
+        if (parsed.error.code) status = parsed.error.code;
+        if (parsed.error.message) message = parsed.error.message;
+        if (parsed.error.status) rawText += ' ' + parsed.error.status.toLowerCase();
+      }
+    } catch (e) {
+      // Ignore JSON parse failure and proceed with string matching
+    }
+  }
+
+  if (typeof status === 'string' && !isNaN(Number(status))) {
+    status = Number(status);
+  }
+
+  return { status, message, rawText };
+}
+
+/**
  * Helper to determine if an error qualifies for Groq Fallback:
- * - Rate limit (429)
- * - Service unavailable / timeout (503 / 504)
- * - Model not found / access denied (404 / specific model error)
- * 
- * Must NOT trigger fallback for:
- * - Bad API keys (401 / 403)
- * - Malformed client input / bad prompt (400)
  */
 function isFallbackEligibleError(err) {
   if (!err) return false;
 
-  const status = err.status || (err.response && err.response.status);
-  const msg = (err.message || '').toLowerCase();
+  const { status, rawText } = extractErrorInfo(err);
 
   // Explicit Auth / Invalid Key checks -> Fail fast
-  if (status === 401 || status === 403 || msg.includes('invalid api key') || msg.includes('api_key_invalid') || msg.includes('unauthorized')) {
+  if (
+    status === 401 ||
+    status === 403 ||
+    rawText.includes('invalid api key') ||
+    rawText.includes('api_key_invalid') ||
+    rawText.includes('unauthorized') ||
+    rawText.includes('permission_denied')
+  ) {
     return false;
   }
 
   // Explicit Bad Client Input checks -> Fail fast
-  if (status === 400 && !msg.includes('model') && !msg.includes('not found')) {
+  if (
+    status === 400 &&
+    !rawText.includes('model') &&
+    !rawText.includes('not found') &&
+    !rawText.includes('unavailable')
+  ) {
     return false;
   }
 
-  // Eligible errors for fallback
+  // Eligible status codes for fallback
   if (status === 429 || status === 503 || status === 504 || status === 404) {
     return true;
   }
 
-  if (msg.includes('quota') || msg.includes('rate limit') || msg.includes('resource_exhausted') || msg.includes('overloaded') || msg.includes('model not found') || msg.includes('not_found')) {
+  // Eligible keyword / status string matches
+  if (
+    rawText.includes('unavailable') ||
+    rawText.includes('high demand') ||
+    rawText.includes('quota') ||
+    rawText.includes('rate limit') ||
+    rawText.includes('resource_exhausted') ||
+    rawText.includes('overloaded') ||
+    rawText.includes('model not found') ||
+    rawText.includes('not_found') ||
+    rawText.includes('try again later')
+  ) {
     return true;
   }
 
@@ -52,12 +98,26 @@ async function generateSummary(text, pageTitle = '') {
   const groqApiKey = process.env.GROQ_API_KEY;
   const groqModel = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 
-  const systemPrompt = `You are a professional AI web content summarizer. 
-Summarize the provided webpage text concisely.
-Format your output cleanly into:
-1. A 2-3 sentence Executive Overview.
-2. 3-5 key bullet point takeaways.
-Keep the tone informative, neutral, and direct.`;
+  const systemPrompt = `You are a professional AI web content analyst.
+Summarize the provided webpage content into clear, well-structured Markdown.
+
+Format your output into the following sections when applicable:
+### Executive Overview
+Provide a concise 2-3 sentence summary capturing the core premise or main takeaway.
+
+### Key Takeaways
+Use a bulleted list to highlight 3-5 primary points or major findings.
+
+### Important Details
+Highlight essential facts, names, figures, key data points, or dates mentioned in the source content. Avoid fluff.
+
+### Practical Conclusions
+Provide a 1-2 sentence concluding synthesis or practical implication.
+
+Rules:
+- Base facts strictly on the provided text. Never invent facts or make unsupported claims.
+- Keep the language crisp, direct, and professional.
+- Do not add meta-commentary like "Here is the summary". Start directly with ### Executive Overview.`;
 
   const userContent = `Page Title: "${pageTitle}"\n\nWebpage Text:\n${text}`;
 
@@ -129,26 +189,36 @@ Keep the tone informative, neutral, and direct.`;
     try {
       return await callGemini();
     } catch (primaryErr) {
-      // Check if eligible for fallback
-      if (isFallbackEligibleError(primaryErr) && groqApiKey && groqApiKey !== 'your_groq_api_key_here') {
-        try {
-          return await callGroq();
-        } catch (fallbackErr) {
-          // Both failed -> throw sanitized double-failure error
-          const err = new Error('AI service is currently unavailable. Both primary and fallback AI providers failed.');
+      const isGroqConfigured = groqApiKey && groqApiKey.trim() !== '' && groqApiKey !== 'your_groq_api_key_here';
+      
+      if (isFallbackEligibleError(primaryErr)) {
+        if (isGroqConfigured) {
+          try {
+            return await callGroq();
+          } catch (fallbackErr) {
+            const err = new Error('AI service is currently experiencing high demand. Both primary and fallback AI providers failed.');
+            err.status = 503;
+            err.isSanitized = true;
+            throw err;
+          }
+        } else {
+          const err = new Error('The primary AI model is currently experiencing high demand (HTTP 503). Please try again in a few moments, or configure GROQ_API_KEY in server/.env for automatic fallback.');
+          err.status = 503;
           err.isSanitized = true;
           throw err;
         }
       }
 
-      // If auth failed, bad request, or fallback not available / not eligible
-      if (primaryErr.status === 401 || primaryErr.status === 403) {
+      const { status } = extractErrorInfo(primaryErr);
+      if (status === 401 || status === 403) {
         const err = new Error('AI Provider authentication failed. Please check backend API key configuration.');
+        err.status = 401;
         err.isSanitized = true;
         throw err;
       }
 
       const err = new Error(primaryErr.isSanitized ? primaryErr.message : `AI Provider Error: ${primaryErr.message}`);
+      err.status = status || 500;
       err.isSanitized = true;
       throw err;
     }
@@ -157,6 +227,7 @@ Keep the tone informative, neutral, and direct.`;
       return await callGroq();
     } catch (err) {
       const sanitizedErr = new Error(`Groq AI Provider Error: ${err.message}`);
+      sanitizedErr.status = err.status || 500;
       sanitizedErr.isSanitized = true;
       throw sanitizedErr;
     }
@@ -167,5 +238,6 @@ Keep the tone informative, neutral, and direct.`;
 
 module.exports = {
   generateSummary,
-  isFallbackEligibleError
+  isFallbackEligibleError,
+  extractErrorInfo
 };

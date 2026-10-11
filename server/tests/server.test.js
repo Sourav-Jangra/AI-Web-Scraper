@@ -1,7 +1,7 @@
 const request = require('supertest');
 const app = require('../src/index');
 const { isPrivateIp, validateUrlSecurity } = require('../src/utils/urlSecurity');
-const { isFallbackEligibleError } = require('../src/utils/aiSummarizer');
+const { isFallbackEligibleError, extractErrorInfo } = require('../src/utils/aiSummarizer');
 
 describe('Full-Stack AI Web Scraper Backend Test Suite', () => {
 
@@ -46,6 +46,23 @@ describe('Full-Stack AI Web Scraper Backend Test Suite', () => {
       expect(isFallbackEligibleError(err)).toBe(true);
     });
 
+    test('should parse and trigger fallback for Google Gen AI SDK stringified JSON 503 errors', () => {
+      const sdkError = {
+        name: 'ApiError',
+        message: JSON.stringify({
+          error: {
+            code: 503,
+            message: 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.',
+            status: 'UNAVAILABLE'
+          }
+        })
+      };
+
+      const info = extractErrorInfo(sdkError);
+      expect(info.status).toBe(503);
+      expect(isFallbackEligibleError(sdkError)).toBe(true);
+    });
+
     test('should trigger fallback for 404 model not found errors', () => {
       const err = new Error('Model not found');
       err.status = 404;
@@ -65,7 +82,7 @@ describe('Full-Stack AI Web Scraper Backend Test Suite', () => {
     });
   });
 
-  describe('3. API Endpoint Input Validation & Error Masking', () => {
+  describe('3. API Endpoint Integration & Error Path Mapping', () => {
     test('GET /api/health should return ok', async () => {
       const res = await request(app).get('/api/health');
       expect(res.statusCode).toEqual(200);
@@ -89,6 +106,26 @@ describe('Full-Stack AI Web Scraper Backend Test Suite', () => {
       expect(res.body.success).toBe(false);
       expect(res.body.error).toContain('forbidden');
       expect(res.body.stack).toBeUndefined();
+    });
+
+    test('POST /api/summarize error path mapping should return HTTP 422 with operational scraper error string', async () => {
+      const errorHandler = require('../src/middleware/errorHandler');
+      const req = {};
+      const res = {
+        status: jest.fn().mockReturnThis(),
+        json: jest.fn()
+      };
+      const err = new Error('Webpage contains insufficient readable text content to generate a summary.');
+      err.status = 422;
+      err.isSanitized = true;
+      
+      errorHandler(err, req, res, jest.fn());
+
+      expect(res.status).toHaveBeenCalledWith(422);
+      expect(res.json).toHaveBeenCalledWith({
+        success: false,
+        error: 'Webpage contains insufficient readable text content to generate a summary.'
+      });
     });
   });
 
